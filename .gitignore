@@ -1,0 +1,11 @@
+# Environment variables
+.env
+
+# IDE
+.vscode/
+
+# Logs
+*.log
+
+# Docker
+.dockerignore

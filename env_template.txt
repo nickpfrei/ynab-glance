@@ -1,0 +1,8 @@
+# YNAB API Configuration
+# Copy this file to .env and fill in your values
+# Get your personal access token from https://app.youneedabudget.com/settings/developer
+YNAB_API_TOKEN=your_api_token_here
+
+# Optional: Specify a budget ID if you have multiple budgets
+# Leave empty to use the default budget
+YNAB_BUDGET_ID= 
