@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify
 import pandas as pd
 import os
 from datetime import datetime, timedelta
@@ -13,6 +13,13 @@ app = Flask(__name__)
 
 # Simple in-memory cache
 cache = {
+    'data': None,
+    'timestamp': 0,
+    'ttl': 900  # 15 minutes in seconds
+}
+
+# Cache for monthly goals data
+monthly_cache = {
     'data': None,
     'timestamp': 0,
     'ttl': 900  # 15 minutes in seconds
@@ -92,8 +99,11 @@ def get_ynab_spending_data():
         category_spending = df.groupby('category_group')['amount'].sum().reset_index()
         category_spending = category_spending.sort_values('amount', ascending=False)
         
+        # Filter out Internal Master Category after grouping
+        category_spending = category_spending[category_spending['category_group'] != 'Internal Master Category']
+        
         # Get top 5
-        top_5 = category_spending.head(5)
+        top_5 = category_spending.head(5).copy()
         
         # Calculate percentages
         total_spending = df['amount'].sum()
@@ -118,6 +128,135 @@ def get_ynab_spending_data():
     except Exception as e:
         return None, str(e)
 
+def get_monthly_goals_data():
+    """Get current month spending vs category goals"""
+    
+    # Check cache first
+    current_time = time.time()
+    if monthly_cache['data'] and (current_time - monthly_cache['timestamp']) < monthly_cache['ttl']:
+        return monthly_cache['data'], None
+    
+    try:
+        # Get API token from environment
+        api_token = os.getenv('YNAB_API_TOKEN')
+        budget_id = os.getenv('YNAB_BUDGET_ID')
+        
+        if not api_token:
+            return None, "API token not found"
+            
+        # Initialize YNAB client
+        ynab = YNAB(api_token)
+        
+        # Get budget
+        if budget_id:
+            budget_response = ynab.budgets.get_budget(budget_id)
+            budget = budget_response.data.budget
+        else:
+            budgets_response = ynab.budgets.get_budgets()
+            if not budgets_response.data.budgets:
+                return None, "No budgets found"
+            budget = budgets_response.data.budgets[0]
+            budget_id = budget.id
+        
+        # Get transactions for current month
+        now = datetime.now()
+        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        transactions_response = ynab.transactions.get_transactions(budget_id)
+        
+        # Get categories with goals
+        categories_response = ynab.categories.get_categories(budget_id)
+        
+        # Process transactions for current month
+        tx_data = []
+        for tx in transactions_response.data.transactions:
+            tx_date = pd.to_datetime(tx.date)
+            if tx_date >= start_of_month and tx.amount < 0:  # Current month expenses only
+                tx_data.append({
+                    'date': tx.date,
+                    'amount': abs(tx.amount / 1000),  # Convert from milliunits and make positive
+                    'category_id': tx.category_id,
+                    'category_name': tx.category_name
+                })
+        
+        if not tx_data:
+            return [], None
+        
+        df = pd.DataFrame(tx_data)
+        df = df[df['category_name'] != 'Uncategorized']  # Remove uncategorized
+        
+        # Add category assigned amounts to dataframe using whitelist
+        
+        # Whitelist of specific categories to include (in desired order)
+        # Read from environment variable, fallback to default list
+        categories_env = os.getenv('YNAB_MONTHLY_CATEGORIES')
+        if categories_env:
+            # Split by comma and strip whitespace
+            whitelist_categories = [cat.strip() for cat in categories_env.split(',')]
+        else:
+            # Throw an error
+            raise ValueError("YNAB_MONTHLY_CATEGORIES environment variable is not set")
+
+        
+        # Build assigned/budgeted amounts and category lookup for whitelisted categories
+        category_assigned = {}
+        category_lookup = {}  # name -> category object
+        for group in categories_response.data.category_groups:
+            for category in group.categories:
+                if category.name in whitelist_categories:
+                    assigned_amount = category.budgeted / 1000 if category.budgeted else 0
+                    category_assigned[category.id] = assigned_amount
+                    category_lookup[category.name] = category
+        
+        # Calculate spending by individual category
+        category_spending = df.groupby(['category_id', 'category_name'])['amount'].sum().reset_index()
+        
+        # Create a lookup for spending amounts
+        spending_lookup = {}
+        for _, row in category_spending.iterrows():
+            spending_lookup[row['category_id']] = row['amount']
+        
+        # Get all whitelisted categories in the specified order
+        result = []
+        for category_name in whitelist_categories:
+            if category_name in category_lookup:
+                category = category_lookup[category_name]
+                category_id = category.id
+                spent = spending_lookup.get(category_id, 0)  # 0 if no spending
+                assigned_amount = category_assigned.get(category_id, 0)
+                
+                # Handle negative assigned amounts (transfers out of category)
+                # If assigned is negative and available is 0, then no overspending occurred
+                available_amount = category.balance / 1000 if category.balance else 0
+                
+                if assigned_amount < 0 and available_amount == 0:
+                    # Money was transferred out and category is at zero - no overspending
+                    difference = 0
+                else:
+                    # Normal calculation
+                    difference = assigned_amount - spent
+                
+                result.append({
+                    'category_name': category_name,
+                    'spent': spent,
+                    'spent_formatted': f"{spent:,.0f}",
+                    'assigned': assigned_amount,
+                    'assigned_formatted': f"{assigned_amount:,.0f}",
+                    'available': available_amount,
+                    'available_formatted': f"{available_amount:,.0f}",
+                    'difference': difference,
+                    'difference_formatted': f"{difference:,.2f}"
+                })
+        
+        # Cache the result
+        monthly_cache['data'] = result
+        monthly_cache['timestamp'] = current_time
+        
+        return result, None
+        
+    except Exception as e:
+        return None, str(e)
+
 @app.route('/api/spending')
 def api_spending():
     """JSON API endpoint"""
@@ -125,125 +264,6 @@ def api_spending():
     if error:
         return jsonify({'error': error}), 500
     return jsonify(data)
-
-@app.route('/widget')
-def widget():
-    """HTML widget endpoint for embedding in Glance"""
-    data, error = get_ynab_spending_data()
-    
-    if error:
-        return f"<div style='color: red; padding: 10px;'>Error: {error}</div>"
-    
-    # HTML template for the widget
-    html_template = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                margin: 0;
-                padding: 15px;
-                background-color: #f8f9fa;
-                color: #333;
-            }
-            .spending-widget {
-                background: white;
-                border-radius: 8px;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                overflow: hidden;
-            }
-            .header {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                padding: 15px;
-                text-align: center;
-                font-weight: bold;
-                font-size: 16px;
-            }
-            .spending-list {
-                padding: 0;
-                margin: 0;
-                list-style: none;
-            }
-            .spending-item {
-                padding: 12px 15px;
-                border-bottom: 1px solid #eee;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }
-            .spending-item:last-child {
-                border-bottom: none;
-            }
-            .category-info {
-                flex: 1;
-            }
-            .category-group {
-                font-size: 11px;
-                color: #666;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-            }
-            .category-name {
-                font-size: 14px;
-                font-weight: 500;
-                color: #333;
-                margin-top: 2px;
-            }
-            .amount-info {
-                text-align: right;
-            }
-            .amount {
-                font-size: 14px;
-                font-weight: 600;
-                color: #e74c3c;
-            }
-            .percentage {
-                font-size: 12px;
-                color: #666;
-                margin-top: 2px;
-            }
-            .last-updated {
-                text-align: center;
-                font-size: 11px;
-                color: #999;
-                padding: 10px;
-                background: #f8f9fa;
-                border-top: 1px solid #eee;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="spending-widget">
-            <div class="header">
-                💰 Top Spending (Last 30 Days)
-            </div>
-            <ul class="spending-list">
-                {% for item in data %}
-                <li class="spending-item">
-                    <div class="category-info">
-                        <div class="category-group">{{ item.category_group }}</div>
-                        <div class="category-name">{{ item.category_name }}</div>
-                    </div>
-                    <div class="amount-info">
-                        <div class="amount">${{ "%.2f"|format(item.amount) }}</div>
-                        <div class="percentage">{{ item.percentage }}%</div>
-                    </div>
-                </li>
-                {% endfor %}
-            </ul>
-            <div class="last-updated">
-                Updated: {{ now.strftime('%I:%M %p') }}
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return render_template_string(html_template, data=data, now=datetime.now())
 
 @app.route('/glance')
 def glance_data():
@@ -266,11 +286,18 @@ def glance_data():
 def health():
     """Health check endpoint"""
     cache_age = time.time() - cache['timestamp'] if cache['data'] else 0
+    monthly_cache_age = time.time() - monthly_cache['timestamp'] if monthly_cache['data'] else 0
     return jsonify({
         'status': 'healthy', 
         'timestamp': datetime.now().isoformat(),
-        'cache_age_seconds': cache_age,
-        'cache_valid': cache_age < cache['ttl'] if cache['data'] else False
+        'spending_cache': {
+            'age_seconds': cache_age,
+            'valid': cache_age < cache['ttl'] if cache['data'] else False
+        },
+        'monthly_goals_cache': {
+            'age_seconds': monthly_cache_age,
+            'valid': monthly_cache_age < monthly_cache['ttl'] if monthly_cache['data'] else False
+        }
     })
 
 @app.route('/cache/clear')
@@ -278,7 +305,112 @@ def clear_cache():
     """Clear the cache"""
     cache['data'] = None
     cache['timestamp'] = 0
+    monthly_cache['data'] = None
+    monthly_cache['timestamp'] = 0
     return jsonify({'message': 'Cache cleared', 'timestamp': datetime.now().isoformat()})
+
+@app.route('/api/monthly-goals')
+def api_monthly_goals():
+    """JSON API endpoint for monthly spending vs goals"""
+    data, error = get_monthly_goals_data()
+    if error:
+        return jsonify({'error': error}), 500
+    return jsonify(data)
+
+@app.route('/monthly-goals')
+def monthly_goals_glance():
+    """Glance endpoint for monthly spending vs goals"""
+    data, error = get_monthly_goals_data()
+    
+    if error:
+        return jsonify({'error': error}), 500
+    
+    # Format data for Glance template
+    response = {
+        'categories': data,
+        'updated': datetime.now().strftime('%I:%M %p'),
+        'total_categories': len(data)
+    }
+    
+    return jsonify(response)
+
+@app.route('/debug/category-groups')
+def debug_category_groups():
+    """Debug endpoint to show all category group names"""
+    try:
+        # Get API token from environment
+        api_token = os.getenv('YNAB_API_TOKEN')
+        budget_id = os.getenv('YNAB_BUDGET_ID')
+        
+        if not api_token:
+            return jsonify({'error': 'API token not found'}), 500
+            
+        # Initialize YNAB client
+        ynab = YNAB(api_token)
+        
+        # Get budget
+        if budget_id:
+            budget_response = ynab.budgets.get_budget(budget_id)
+            budget = budget_response.data.budget
+        else:
+            budgets_response = ynab.budgets.get_budgets()
+            if not budgets_response.data.budgets:
+                return jsonify({'error': 'No budgets found'}), 500
+            budget = budgets_response.data.budgets[0]
+            budget_id = budget.id
+        
+        # Get categories
+        categories_response = ynab.categories.get_categories(budget_id)
+        
+        # Show all category groups and their categories
+        result = {}
+        for group in categories_response.data.category_groups:
+            group_categories = []
+            for category in group.categories:
+                group_categories.append({
+                    'id': category.id,
+                    'name': category.name,
+                    'has_goal': category.goal_target is not None
+                })
+            result[group.name] = {
+                'repr': repr(group.name),
+                'categories': group_categories
+            }
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/debug/monthly-goals-order')
+def debug_monthly_goals_order():
+    """Debug endpoint to show the exact order of monthly goals data"""
+    # Clear cache to get fresh data
+    monthly_cache['data'] = None
+    monthly_cache['timestamp'] = 0
+    
+    data, error = get_monthly_goals_data()
+    
+    if error:
+        return jsonify({'error': error}), 500
+    
+    # Show the exact order with index numbers
+    debug_result = []
+    for i, item in enumerate(data):
+        debug_result.append({
+            'index': i,
+            'category_name': item['category_name'],
+            'difference': item['difference'],
+            'difference_formatted': item['difference_formatted'],
+            'assigned': item['assigned'],
+            'spent': item['spent'],
+            'available': item.get('available', 'N/A')
+        })
+    
+    return jsonify({
+        'total_items': len(debug_result),
+        'items': debug_result
+    })
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5001) 

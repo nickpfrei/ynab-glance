@@ -9,3 +9,6 @@
 
 # Docker
 .dockerignore
+
+# macOS
+.DS_Store

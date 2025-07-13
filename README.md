@@ -1,30 +1,39 @@
 # YNAB Glance Integration
 
-A clean, native integration between [YNAB (You Need A Budget)](https://www.ynab.com/) and [Glance](https://github.com/glanceapp/glance) dashboard that displays your top spending categories with amounts and percentages.
+A clean, native integration between [YNAB (You Need A Budget)](https://www.ynab.com/) and [Glance](https://github.com/glanceapp/glance) dashboard that displays your spending data in two complementary widgets.
 
 ## Features
 
 - **Real-time spending data** from YNAB API
-- **Top 5 spending categories** grouped by category group
+- **Two dashboard widgets**:
+  - **Monthly Budget Remaining**: Shows assigned vs spent for specific categories this month
+  - **30-Day Spending Trends**: Top 5 spending category groups over last 30 days
 - **Clean, native styling** that matches your Glance dashboard theme
 - **US number formatting** with comma separators (e.g., $4,554)
 - **Intelligent caching** (15-minute cache) for fast response times
 - **Dockerized service** for easy deployment
-- **Last 30 days** spending analysis
+- **Custom category filtering** for monthly budget tracking
 
 ## Demo
 
-The widget displays your spending data in a clean, three-column format that seamlessly integrates with your Glance dashboard's native styling:
+The integration provides two complementary widgets that display your YNAB data in clean, native styling:
 
-![YNAB Spending Widget](img/YNAB%20Spending%20Widget.jpg)
+### 1. Monthly Budget Remaining
+Shows how much money you have left in each category for the current month:
+```
+Groceries                     $125.50
+Gas / Fuel Expenses           $87.25
+Fun Spending                  $45.00
+Personal Care                 $32.75
+Eating Out                    $15.25
+Entertainment                 $-8.50
+Baby Items                    $0.00
+Unexpected Expenses           $0.00
+Clothing                      $0.00
+```
 
-**Widget Features:**
-- **Category Group** (left): Your YNAB category groups
-- **Amount** (right): Dollar amount spent with comma formatting
-- **Percentage** (right, smaller): Percentage of total spending
-- **Native Glance styling**: No custom backgrounds, matches your dashboard theme
-
-Example data structure:
+### 2. 30-Day Spending Trends
+Shows your top spending category groups over the last 30 days:
 ```
 🏠 Housing & Utilities         $2,150  35.2%
 🛒 Groceries & Food           $1,325  21.7%
@@ -32,6 +41,13 @@ Example data structure:
 💊 Healthcare                 $675    11.0%
 🎬 Entertainment              $465    7.6%
 ```
+
+![YNAB Spending Widget](img/YNAB%20Spending%20Widget.jpg)
+
+**Widget Features:**
+- **Native Glance styling**: No custom backgrounds, matches your dashboard theme
+- **US number formatting**: Dollar signs and comma separators
+- **Real-time updates**: 5-minute cache for responsive data
 
 ## Prerequisites
 
@@ -59,9 +75,13 @@ Example data structure:
    ```bash
    YNAB_API_TOKEN=your_api_token_here
    # YNAB_BUDGET_ID=optional_specific_budget_id
+   # YNAB_MONTHLY_CATEGORIES=Groceries,Transportation,Entertainment,Dining Out
    ```
 
-   **Note**: If you have multiple budgets, you can specify a particular budget ID. Otherwise, it will use your first budget.
+   **Notes**: 
+   - If you have multiple budgets, you can specify a particular budget ID. Otherwise, it will use your first budget.
+   - Customize `YNAB_MONTHLY_CATEGORIES` with your own category names in your desired order
+   - If you don't set `YNAB_MONTHLY_CATEGORIES`, it will use the default categories
 
 ### 3. Build and Run the Service
 
@@ -76,20 +96,47 @@ Example data structure:
    curl http://localhost:5001/health
    ```
 
-3. Test the spending endpoint:
+3. Test both endpoints:
    ```bash
+   # Test 30-day spending trends
    curl http://localhost:5001/glance
+   
+   # Test monthly budget remaining
+   curl http://localhost:5001/monthly-goals
    ```
 
-### 4. Configure Glance Widget
+### 4. Configure Glance Widgets
 
-Add the following widget to your Glance `home.yml` configuration:
+Add both widgets to your Glance `home.yml` configuration:
 
 ```yaml
+# Monthly Budget Remaining Widget
 - type: custom-api
-  title: YNAB Spending
+  title: Budget Remaining (This Month)
+  url: http://host.docker.internal:5001/monthly-goals
+  cache: 5m
+  request-timeout: 10
+  template: |
+    {{- if .JSON.Exists "error" }}
+      <div>Error: {{ .JSON.String "error" }}</div>
+    {{- else }}
+      {{- range .JSON.Array "categories" }}
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <div style="flex: 1;">
+          <div>{{ .String "category_name" }}</div>
+        </div>
+        <div style="text-align: right;">
+          <div>${{ .String "difference_formatted" }}</div>
+        </div>
+      </div>
+      {{- end }}
+    {{- end }}
+
+# 30-Day Spending Trends Widget
+- type: custom-api
+  title: Spending (30d Trailing)
   url: http://host.docker.internal:5001/glance
-  cache: 60m
+  cache: 5m
   request-timeout: 10
   template: |
     {{- if .JSON.Exists "error" }}
@@ -119,17 +166,43 @@ docker restart glance
 
 The YNAB service provides several endpoints:
 
-- **`/glance`** - JSON data optimized for Glance widget
-- **`/api/spending`** - Raw JSON spending data
-- **`/widget`** - Standalone HTML widget
+### Primary Endpoints
+- **`/glance`** - JSON data for 30-day spending trends widget
+- **`/monthly-goals`** - JSON data for monthly budget remaining widget
+
+### API Endpoints
+- **`/api/spending`** - Raw JSON spending data (30-day trends)
+- **`/api/monthly-goals`** - Raw JSON monthly budget data
+
+### Utility Endpoints
 - **`/health`** - Health check with cache status
 - **`/cache/clear`** - Clear the data cache
+- **`/debug/monthly-goals-order`** - Debug endpoint to verify category order
 
 ## Configuration
 
 ### Docker Compose
 
 The service runs on port 5001 by default. You can modify `docker-compose.yml` to change the port or other settings.
+
+### Monthly Goals Categories
+
+The monthly budget widget tracks a specific whitelist of categories in a predefined order. You can customize which categories are tracked by setting the `YNAB_MONTHLY_CATEGORIES` environment variable in your `.env` file:
+
+```bash
+# Comma-separated list of category names (in desired order)
+YNAB_MONTHLY_CATEGORIES=Groceries,Transportation,Entertainment,Dining Out,Personal Care
+```
+
+**Configuration Tips:**
+- Categories appear in the exact order you specify in the environment variable
+- Category names must match exactly as they appear in your YNAB budget
+- Use the debug endpoint to verify exact category names:
+  ```bash
+  curl http://localhost:5001/debug/category-groups
+  ```
+- If you don't set this variable, the service will use the default categories
+- This keeps your personal category names out of the code repository
 
 ### Caching
 
@@ -183,6 +256,19 @@ If you need to force refresh the data:
 ```bash
 curl http://localhost:5001/cache/clear
 ```
+
+### Monthly Goals Widget Issues
+
+1. **Categories not appearing**: Verify category names match exactly using the debug endpoint:
+   ```bash
+   curl http://localhost:5001/debug/category-groups
+   ```
+
+2. **Wrong order**: Categories appear in the order specified in the `whitelist_categories` list in `ynab_service.py`
+
+3. **Negative assigned amounts**: The widget handles money transfers correctly:
+   - If assigned amount is negative (money moved out) and available is $0, shows $0.00
+   - Otherwise shows the difference between assigned and spent amounts
 
 ## Development
 
