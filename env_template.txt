@@ -10,3 +10,10 @@ YNAB_BUDGET_ID=your_budget_id_here
 # Optional: Customize monthly budget categories (comma-separated, in desired order)
 # Use the /debug/category-groups endpoint to find exact category names
 YNAB_MONTHLY_CATEGORIES=your_categories_here
+
+# Monthly income for savings rate calculation (in dollars, no commas)
+YNAB_MONTHLY_INCOME=your_income_here
+
+# Savings accounts to track (comma-separated account names)
+# Use the /debug/accounts endpoint to find exact account names
+YNAB_SAVINGS_ACCOUNTS=your_savings_accounts_here
